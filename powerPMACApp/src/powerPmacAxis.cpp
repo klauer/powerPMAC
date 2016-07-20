@@ -59,12 +59,16 @@ powerPmacAxis::powerPmacAxis(powerPmacController *pC, int axisNo)
   amp_enabled_ = 0;
   fatal_following_ = 0;
   encoder_axis_ = 0;
-  limitsCheckDisable_ = 0;
+  limitsCheckDisable_ = 1;
   errorPrintCount_ = 0;
   errorPrintFlag_ = 0;
+  pgainScale_ = 100.;
 
   // Set an EPICS exit handler that will shut down polling before asyn kills the IP sockets
   epicsAtExit(shutdownCallback, pC_);
+
+  // Allow PID parameters to be set
+  setIntegerParam(pC_->motorStatusGainSupport_, 1);
 
   //Do an initial poll to get some values from the PMAC
   if (getAxisInitialStatus() != asynSuccess) {
@@ -86,32 +90,26 @@ asynStatus powerPmacAxis::getAxisInitialStatus(void)
   int cmdStatus = 0;
   double low_limit = 0.0;
   double high_limit = 0.0;
-  double pgain = 0.0;
-  double igain = 0.0;
-  double dgain = 0.0;
   int dummy = 0;
   int nvals = 0;
 
   static const char *functionName = "powerPmacAxis::getAxisInitialStatus";
 
   //sprintf(command, "I%d13 I%d14 I%d30 I%d31 I%d33", axisNo_, axisNo_, axisNo_, axisNo_, axisNo_);
-  sprintf(command, "Motor[%d].MaxPos Motor[%d].MinPos Motor[%d].Servo.Kp Motor[%d].Servo.Kvfb Motor[%d].Servo.Ki", axisNo_, axisNo_, axisNo_, axisNo_, axisNo_);
+  sprintf(command, "Motor[%d].MaxPos Motor[%d].MinPos", axisNo_, axisNo_);
   cmdStatus = pC_->lowLevelWriteRead(command, response, sizeof(response));
   //nvals = sscanf(response, "I%d=%lf\nI%d=%lf\nI%d=%lf\nI%d=%lf\nI%d=%lf", &dummy, &high_limit, &dummy, &low_limit, &dummy, &pgain, &dummy, &dgain, &dummy, &igain);
-  nvals = sscanf(response, "Motor[%d].MaxPos=%lf\nMotor[%d].MinPos=%lf\nMotor[%d].Servo.Kp=%lf\nMotor[%d].Servo.Kvfb=%lf\nMotor[%d].Servo.Ki=%lf", &dummy, &high_limit, &dummy, &low_limit, &dummy, &pgain, &dummy, &dgain, &dummy, &igain);
+  nvals = sscanf(response, "Motor[%d].MaxPos=%lf\nMotor[%d].MinPos=%lf", &dummy, &high_limit, &dummy, &low_limit);
 
-  if (cmdStatus || nvals != 10) {
+  if (cmdStatus || nvals != 4) {
     asynPrint(pC_->pasynUserSelf, ASYN_TRACE_ERROR, "%s: Error: initial status poll failed on axis %d.\n", functionName, axisNo_);
     return asynError;
   } else {
     setDoubleParam(pC_->motorLowLimit_,  low_limit*scale_);
     setDoubleParam(pC_->motorHighLimit_, high_limit*scale_);
-    setDoubleParam(pC_->motorPgain_,     pgain);
-    setDoubleParam(pC_->motorIgain_,     igain);
-    setDoubleParam(pC_->motorDgain_,     dgain);
     setIntegerParam(pC_->motorStatusHasEncoder_, 1);
   }
-  return asynSuccess;
+  return getPIDGains();
 }
 
 
@@ -136,14 +134,16 @@ asynStatus powerPmacAxis::move(double position, int relative, double min_velocit
   if (max_velocity != 0) {
     sprintf(vel_buff, "Motor[%d].JogSpeed=%f ", axisNo_, (max_velocity / (scale_ * 1000.0) ));
   }
-  if (acceleration != 0) {
-    if (max_velocity != 0) {
+  if (acceleration > 1e-6) {
+    if (fabs(max_velocity) > 1e-6) {
       sprintf(acc_buff, "Motor[%d].JogTa=%f ", axisNo_, (fabs(max_velocity/acceleration) * 1000.0));
     }
   }
 
-  sprintf( command, "%s%s#%d %s%.2f", vel_buff, acc_buff, axisNo_, (relative?"J^":"J="), position/scale_ );
+  sprintf( command, "%s%s#%d %s%.4f", vel_buff, acc_buff, axisNo_, (relative?"J^":"J="), position/scale_ );
 
+  asynPrint(pC_->pasynUserSelf, ASYN_TRACE_FLOW,
+            "move command: %s (relative=%d)\n", command, relative);
   status = pC_->lowLevelWriteRead(command, response, sizeof(response));
   
   return status;
@@ -409,4 +409,74 @@ asynStatus powerPmacAxis::setIntegerParam(int function, int value)
   //Call base class method
   status = asynMotorAxis::setIntegerParam(function, value);
   return status;
+}
+
+asynStatus powerPmacAxis::getPIDGains() {
+
+  char command[pC_->PMAC_MAXBUF_];
+  char response[pC_->PMAC_MAXBUF_];
+  int cmdStatus = 0;
+  double pgain = 0.0;
+  double igain = 0.0;
+  double dgain = 0.0;
+  int dummy = 0;
+  int nvals = 0;
+
+  static const char *functionName = "powerPmacAxis::getPIDGains";
+
+  sprintf(command, "Motor[%d].Servo.Kp Motor[%d].Servo.Kvfb Motor[%d].Servo.Ki", axisNo_, axisNo_, axisNo_);
+  cmdStatus = pC_->lowLevelWriteRead(command, response, sizeof(response));
+  nvals = sscanf(response, "Motor[%d].Servo.Kp=%lf\nMotor[%d].Servo.Kvfb=%lf\nMotor[%d].Servo.Ki=%lf", &dummy, &pgain, &dummy, &dgain, &dummy, &igain);
+
+  if (cmdStatus || nvals != 6) {
+    asynPrint(pC_->pasynUserSelf, ASYN_TRACE_ERROR, "%s: Error: failed to read PID gains on axis %d.\n", functionName, axisNo_);
+    return asynError;
+  } else {
+    setDoubleParam(pC_->motorPGain_, pgain / pgainScale_);
+    setDoubleParam(pC_->motorIGain_, igain);
+    setDoubleParam(pC_->motorDGain_, dgain);
+
+    asynPrint(pC_->pasynUserSelf, ASYN_TRACE_FLOW, "Axis %d P: %g (normalized: %g)\n", axisNo_, pgain,
+              pgain / pgainScale_);
+    asynPrint(pC_->pasynUserSelf, ASYN_TRACE_FLOW, "Axis %d I: %g\n", axisNo_, igain);
+    asynPrint(pC_->pasynUserSelf, ASYN_TRACE_FLOW, "Axis %d D: %g\n", axisNo_, dgain);
+    printf("Axis %d P: %g (normalized: %g)\n", axisNo_, pgain,
+           pgain / pgainScale_);
+    printf("Axis %d I: %g\n", axisNo_, igain);
+    printf("Axis %d D: %g\n", axisNo_, dgain);
+    callParamCallbacks();
+    return asynSuccess;
+  }
+}
+
+asynStatus powerPmacAxis::setPIDGain(const char* gain_ch, epicsFloat64 value) {
+  if (value < 0) {
+    return asynError;
+  }
+
+  char command[pC_->PMAC_MAXBUF_];
+  char response[pC_->PMAC_MAXBUF_];
+
+  sprintf(command, "Motor[%d].Servo.K%s=%g", axisNo_, gain_ch, value);
+  asynPrint(pC_->pasynUserSelf, ASYN_TRACE_FLOW,
+            "Setting motor #%d K%s to %g... (%s)\n",
+            axisNo_, gain_ch, value, command);
+  printf("Setting motor #%d K%s to %g... (%s)\n",
+         axisNo_, gain_ch, value, command);
+
+  asynStatus ret = pC_->lowLevelWriteRead(command, response, sizeof(response));
+  getPIDGains();
+  return ret;
+}
+
+asynStatus powerPmacAxis::setPGain(epicsFloat64 value) {
+  return setPIDGain("p", value * pgainScale_);
+}
+
+asynStatus powerPmacAxis::setIGain(epicsFloat64 value) {
+  return setPIDGain("i", value);
+}
+
+asynStatus powerPmacAxis::setDGain(epicsFloat64 value) {
+  return setPIDGain("vfb", value);
 }

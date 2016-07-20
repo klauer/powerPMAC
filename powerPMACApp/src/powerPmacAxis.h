@@ -31,12 +31,17 @@ class powerPmacAxis : public asynMotorAxis
   virtual asynStatus poll(bool *moving);
   virtual asynStatus setPosition(double position);
   virtual asynStatus setIntegerParam(int function, int value);
+  virtual asynStatus setPGain(epicsFloat64 value);
+  virtual asynStatus setIGain(epicsFloat64 value);
+  virtual asynStatus setDGain(epicsFloat64 value);
 
   protected:
   powerPmacController *pC_;
   
   virtual asynStatus getAxisStatus(bool *moving);
   virtual asynStatus getAxisInitialStatus(void);
+  virtual asynStatus setPIDGain(const char *gain_chan, epicsFloat64 value);
+  virtual asynStatus getPIDGains();
 
   double setpointPosition_;
   double encoderPosition_;
@@ -56,6 +61,7 @@ class powerPmacAxis : public asynMotorAxis
   int limitsCheckDisable_;
   int errorPrintCount_;
   int errorPrintFlag_;
+  float pgainScale_;
 
   friend class powerPmacController;
 };
